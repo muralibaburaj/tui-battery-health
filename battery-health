@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+set -u
+
+readonly CONTROL="/sys/bus/wmi/drivers/acer-wmi-battery/health_mode"
+readonly BATTERY="/sys/class/power_supply/BAT1"
+
+ensure_driver() {
+  if [[ ! -r "$CONTROL" ]]; then
+    printf 'Loading the Acer battery-health driver...\n'
+    pkexec /usr/bin/modprobe acer-wmi-battery || return 1
+  fi
+
+  if [[ ! -r "$CONTROL" ]]; then
+    printf 'Battery-health control is unavailable on this system.\n' >&2
+    return 1
+  fi
+}
+
+health_state() {
+  if [[ "$(<"$CONTROL")" == "1" ]]; then
+    printf 'ON — charging limited to 80%%'
+  else
+    printf 'OFF — full-capacity charging enabled'
+  fi
+}
+
+show_status() {
+  local capacity="unknown" status="unknown" temperature="unknown"
+  [[ -r "$BATTERY/capacity" ]] && capacity="$(<"$BATTERY/capacity")%"
+  [[ -r "$BATTERY/status" ]] && status="$(<"$BATTERY/status")"
+  [[ -r /sys/bus/wmi/drivers/acer-wmi-battery/temperature ]] && \
+    temperature="$(awk '{ printf "%.1f°C", $1 / 1000 }' /sys/bus/wmi/drivers/acer-wmi-battery/temperature)"
+
+  printf 'Battery Health Limit: %s\n' "$(health_state)"
+  printf 'Charge: %s (%s)\n' "$capacity" "$status"
+  printf 'Temperature: %s\n' "$temperature"
+}
+
+set_health_mode() {
+  local target="$1"
+  printf '%s\n' "$target" | pkexec /usr/bin/tee "$CONTROL" >/dev/null || return 1
+  sleep 0.2
+
+  if [[ "$(<"$CONTROL")" != "$target" ]]; then
+    printf 'The firmware did not accept the requested setting.\n' >&2
+    return 1
+  fi
+
+  show_status
+}
+
+interactive_menu() {
+  local selection current
+
+  while true; do
+    clear
+    show_status
+    printf '\n'
+    current="$(<"$CONTROL")"
+
+    if [[ "$current" == "1" ]]; then
+      selection="$(gum choose --header 'Battery health' \
+        'Disable 80% limit' 'Refresh status' 'Exit')" || return 0
+    else
+      selection="$(gum choose --header 'Battery health' \
+        'Enable 80% limit' 'Refresh status' 'Exit')" || return 0
+    fi
+
+    case "$selection" in
+      'Enable 80% limit') set_health_mode 1; gum input --placeholder 'Press Enter to continue' >/dev/null ;;
+      'Disable 80% limit') set_health_mode 0; gum input --placeholder 'Press Enter to continue' >/dev/null ;;
+      'Refresh status') ;;
+      'Exit') return 0 ;;
+    esac
+  done
+}
+
+ensure_driver || exit 1
+
+case "${1:-}" in
+  --enable) set_health_mode 1 ;;
+  --disable) set_health_mode 0 ;;
+  --toggle)
+    if [[ "$(<"$CONTROL")" == "1" ]]; then
+      set_health_mode 0
+    else
+      set_health_mode 1
+    fi
+    ;;
+  --status) show_status ;;
+  --help|-h)
+    printf 'Usage: battery-health [--status|--enable|--disable|--toggle]\n'
+    ;;
+  '') interactive_menu ;;
+  *)
+    printf 'Unknown option: %s\n' "$1" >&2
+    printf 'Usage: battery-health [--status|--enable|--disable|--toggle]\n' >&2
+    exit 2
+    ;;
+esac
